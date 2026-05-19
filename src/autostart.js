@@ -79,10 +79,13 @@ function install() {
   if (!IS_WINDOWS) return { supported: false, installed: false, message: '当前平台不支持任务计划程序（仅 Windows）' };
   _writeBatHelper();
   _runSchtasks(['/Delete', '/TN', TASK_NAME, '/F']);
+  // /DELAY 0001:00 = 登录后延迟 1 分钟再触发，给网络/DNS/VPN/凭证刷新留出就绪时间。
+  // 旧版无延迟导致登录后 1 秒就开始查 API，必失败，然后 60→120→240→300s 退避 11 分钟才恢复。
   const r = _runSchtasks([
     '/Create',
     '/TN', TASK_NAME,
     '/SC', 'ONLOGON',
+    '/DELAY', '0001:00',
     '/RL', 'LIMITED',
     '/F',
     '/TR', BAT_PATH,

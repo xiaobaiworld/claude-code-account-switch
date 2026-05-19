@@ -1,18 +1,21 @@
 """用量监控守护进程。
 
-由状态栏脚本在 active 5h >= 90% 时 spawn，自带调度循环：
+调度循环：
+  5h < 90        → 100s 轮询，闲时省查询（v3.10.2 拆分自旧 60s）
   90 <= 5h < 96  → 60s 轮询
   96 <= 5h < 99  → 10s 轮询
-  5h >= 99       → 立即切换，退出
-  429            → 当作撞墙，立即切换，退出
-  5h < 90        → 用量降下来了（切换成功或自然 reset），退出
-  连续错误 >= 5  → 退出
-  运行超 2 小时  → 退出（防意外泄漏）
+  5h >= 99       → 切换（成功也不退出，继续盯新 active）
+  429            → 当作 active 用尽，写表 + 切换（v3.10.2+）
+  其他错误       → 固定 60s 重试（v3.10.1+）
+  全候选用尽     → sleep 到最早 reset + 60s 再醒（v3.10.2+）
+  disabled 文件  → 退出
+  运行超 7 天    → 退出（兜底）
 
 单例保护：~/.ccs/usage-monitor.pid
 """
 import json, os, sys, time, atexit
 import urllib.request, urllib.error
+from datetime import datetime, timezone
 
 PID_FILE  = os.path.expanduser('~/.ccs/usage-monitor.pid')
 LOG       = os.path.expanduser('~/.ccs/auto-switch.log')
@@ -21,8 +24,9 @@ DISABLED  = os.path.expanduser('~/.ccs/usage-monitor.disabled')
 MONITOR_THRESHOLD  = 90   # 低于此值退出
 FAST_THRESHOLD     = 96   # 高于此值进入 10s 模式
 SWITCH_THRESHOLD   = 99   # 高于此值触发切换
-INTERVAL_SLOW      = 60
-INTERVAL_FAST      = 10
+INTERVAL_IDLE      = 100  # 5h < 90% 闲时轮询间隔（v3.10.2 拆分；越闲查得越稀）
+INTERVAL_SLOW      = 60   # 90–95%、错误重试、切换失败重试
+INTERVAL_FAST      = 10   # 96–98% 临界期
 MAX_ERRORS         = 5
 MAX_RUNTIME        = 86400 * 7  # 7 天（实质无限，disabled 文件才是真正的停止信号）
 
@@ -99,7 +103,8 @@ def _acquire_singleton():
 
 def _query_active_usage():
     """查 ~/.claude/.credentials.json 里 token 的 5h 用量。
-    返回 (five_hour:float, resets_at:str) 或 (None, http_code:int) 或 (None, None)。"""
+    返回 (five_hour:float, resets_at:str) 或 (None, http_code:int) 或 (None, None)。
+    走 anthropic_http 共享 cookie jar，避免 Cloudflare _cfuvid 缺失导致的边缘 429。"""
     creds = os.path.expanduser('~/.claude/.credentials.json')
     if not os.path.exists(creds):
         return None, None
@@ -108,31 +113,81 @@ def _query_active_usage():
     except Exception:
         return None, None
     try:
-        req = urllib.request.Request(
-            'https://api.anthropic.com/api/oauth/usage',
-            headers={'Authorization': f'Bearer {token}',
-                     'anthropic-beta': 'oauth-2025-04-20',
-                     'Accept': 'application/json'})
-        resp = json.loads(urllib.request.urlopen(req, timeout=8).read())
-        fh = resp.get('five_hour') or {}
-        return float(fh.get('utilization') or 0.0), fh.get('resets_at') or ''
-    except urllib.error.HTTPError as e:
-        return None, e.code
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, script_dir)
+        from anthropic_http import request_anthropic, is_real_anthropic_429
     except Exception:
         return None, None
+    code, body, headers = request_anthropic(
+        'https://api.anthropic.com/api/oauth/usage', token, timeout=8)
+    if code == 200:
+        try:
+            resp = json.loads(body)
+            fh = resp.get('five_hour') or {}
+            return float(fh.get('utilization') or 0.0), fh.get('resets_at') or ''
+        except Exception:
+            return None, None
+    if code == 429:
+        # 区分真 429（Anthropic 后端，含用尽）vs Cloudflare 边缘 429
+        if is_real_anthropic_429(headers):
+            return None, 429
+        # Cloudflare 拦的（已由 helper 重试 1 次仍失败）：当作普通临时错误，让主循环 60s 重试
+        log(f'cf-429 not from anthropic backend, treat as transient')
+        return None, None
+    return None, code
 
 
-def _do_switch(five_hour, resets_at, force=False):
-    """调 auto_switch_core 完成切换。返回 True 表示切换成功。"""
+def _do_switch(five_hour, resets_at, force=False, active_got_429=False):
+    """调 auto_switch_core 完成切换。
+    返回 dict: {switched, next_reset_at, reason}。
+    next_reset_at 仅在"全候选用尽"时由核心给出，供守护 sleep 到那时再醒。"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         sys.path.insert(0, script_dir)
         import auto_switch_core as core
-        result = core.decide_and_switch(five_hour, resets_at, force_switch=force)
-        return result.get('switched', False)
+        result = core.decide_and_switch(
+            five_hour, resets_at, force_switch=force, active_got_429=active_got_429)
+        return {
+            'switched': result.get('switched', False),
+            'next_reset_at': result.get('next_reset_at'),
+            'reason': result.get('reason', ''),
+        }
     except Exception as e:
         log(f'switch call failed: {e}')
-        return False
+        return {'switched': False, 'next_reset_at': None, 'reason': f'exception: {e}'}
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def _sleep_responsive(seconds, slice_s=30):
+    """切片 sleep：每 slice_s 秒醒一次看 disabled 标志。提前感知关开关。
+    返回 True 表示被 disabled 中断，调用方应退出主循环。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        if os.path.exists(DISABLED):
+            return True
+        time.sleep(min(slice_s, max(0.1, end - time.time())))
+    return False
+
+
+def _sleep_until_reset(reset_iso, safety_s=60):
+    """sleep 到 reset_iso + safety_s。返回 True 表示被 disabled 中断。"""
+    reset_dt = _parse_iso(reset_iso)
+    if not reset_dt:
+        return _sleep_responsive(INTERVAL_SLOW)
+    now = datetime.now(timezone.utc)
+    seconds = (reset_dt - now).total_seconds() + safety_s
+    if seconds <= 0:
+        return False  # reset 已过，立刻进下一轮
+    log(f'monitor: sleeping {int(seconds)}s until {reset_iso} (all candidates exhausted)')
+    return _sleep_responsive(seconds)
 
 
 def main():
@@ -147,6 +202,7 @@ def main():
 
     start_time = time.time()
     errors = 0
+    low_ticks = 0  # 5h < 90% 的连续轮次计数，用于稀疏心跳日志
 
     while True:
         # 超时保护
@@ -161,43 +217,85 @@ def main():
 
         five_hour, extra = _query_active_usage()
 
-        # 429 → 当作撞墙，直接切
+        # 429 → active 用尽（v3.10.2+ 业务约定）：写表标用尽 + 进切换决策
         if five_hour is None and extra == 429:
-            log('monitor: 429 received, treating as wall hit, switching')
-            _do_switch(None, '', force=True)
-            break
+            log('monitor: 429 received, marking active exhausted, attempting switch')
+            r = _do_switch(None, '', force=True, active_got_429=True)
+            next_reset = r.get('next_reset_at')
+            if r['switched'] and next_reset:
+                # 已切到"最早能 reset 的号"，sleep 到它恢复
+                if _sleep_until_reset(next_reset):
+                    break
+                continue
+            if r['switched']:
+                # 切到了正常号，下一轮立刻盯它
+                if _sleep_responsive(INTERVAL_SLOW):
+                    break
+                continue
+            if next_reset:
+                # 没切（active 自己就是最早恢复的），原地 sleep
+                if _sleep_until_reset(next_reset):
+                    break
+                continue
+            # active 没历史 reset 或候选全 unknown：保守 60s 重试
+            if _sleep_responsive(INTERVAL_SLOW):
+                break
+            continue
 
-        # 其他查询失败：指数退避，最长 5 分钟，不退出（网络抖动应自愈）
+        # 其他查询失败：固定 60s 重试，不退出（网络抖动应自愈）。
+        # v3.10.1 前用指数退避 60/120/240/300s，开机自启场景下要 11 分钟才恢复，
+        # 期间用量监控完全失明，不值得；统一 60s 即可。
         if five_hour is None:
             errors += 1
-            backoff = min(INTERVAL_SLOW * (2 ** (errors - 1)), 300)
-            log(f'monitor: query failed ({errors}), retry in {backoff}s')
-            time.sleep(backoff)
+            log(f'monitor: query failed ({errors}), retry in {INTERVAL_SLOW}s')
+            if _sleep_responsive(INTERVAL_SLOW):
+                break
             continue
 
         errors = 0  # 查到数据就重置计数
 
         # 用量低于 90%：从状态栏 spawn 时会预判，但从 Web UI spawn 时无条件启动，
-        # 所以这里不退出，安静等待 60s 继续轮询（disabled / 超时 才是退出条件）
+        # 所以这里不退出，安静等待 60s 继续轮询（disabled / 超时 才是退出条件）。
+        # 每 10 轮（约 10 分钟）记一条心跳日志，确认守护活着；其他轮静默不刷屏。
         if five_hour < MONITOR_THRESHOLD:
-            time.sleep(INTERVAL_SLOW)
+            low_ticks += 1
+            if low_ticks == 1 or low_ticks % 10 == 0:
+                log(f'monitor: 5h={five_hour}% (< {MONITOR_THRESHOLD}%), idle polling every {INTERVAL_IDLE}s')
+            if _sleep_responsive(INTERVAL_IDLE):
+                break
             continue
+        low_ticks = 0  # ≥ 90% 时重置心跳计数
 
         # 触发切换
         if five_hour >= SWITCH_THRESHOLD:
             log(f'monitor: 5h={five_hour}%, triggering switch')
-            switched = _do_switch(five_hour, extra)
-            if switched:
-                break  # 切换成功，守护退出
-            # 切换失败（全满 / 异常），60s 后重试
+            r = _do_switch(five_hour, extra)
+            next_reset = r.get('next_reset_at')
+            if r['switched'] and next_reset:
+                # 切到的是"最早能 reset 的用尽号"，sleep 到它恢复
+                if _sleep_until_reset(next_reset):
+                    break
+                continue
+            if r['switched']:
+                # 切到正常号，继续盯（不退出守护：旧行为 break 后靠 watchdog 拉，乒乓时会失控）
+                if _sleep_responsive(INTERVAL_SLOW):
+                    break
+                continue
+            if next_reset:
+                # active 自己是最早 reset 的，原地 sleep
+                if _sleep_until_reset(next_reset):
+                    break
+                continue
             log('monitor: switch not completed, retry in 60s')
-            time.sleep(INTERVAL_SLOW)
+            if _sleep_responsive(INTERVAL_SLOW):
+                break
             continue
 
         # 90-99% 之间，按频率轮询
         interval = INTERVAL_FAST if five_hour >= FAST_THRESHOLD else INTERVAL_SLOW
         log(f'monitor: 5h={five_hour}%, next check in {interval}s')
-        time.sleep(interval)
+        if _sleep_responsive(interval):
+            break
 
     _remove_pid()
 

@@ -9,7 +9,7 @@ const DISABLED_FILE = path.join(CCS_DIR, 'usage-monitor.disabled');
 const LOG_FILE      = path.join(CCS_DIR, 'auto-switch.log');
 const SCRIPTS_DIR   = path.join(__dirname, '..', 'scripts');
 
-const PY_HELPERS = ['auto_switch_core.py', 'usage_monitor.py'];
+const PY_HELPERS = ['auto_switch_core.py', 'usage_monitor.py', 'anthropic_http.py'];
 
 // ── 进程探活 ──────────────────────────────────────────────────────────────────
 

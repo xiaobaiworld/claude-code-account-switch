@@ -76,6 +76,14 @@ function install() {
   fs.writeFileSync(TARGET_PATH, patched);
   try { fs.chmodSync(TARGET_PATH, 0o755); } catch { /* non-posix */ }
 
+  // 状态栏 Python 段需要 anthropic_http.py 走共享 cookie jar（v3.10.2+）。
+  // monitor 模块也复制这个文件，重复无害；这里独立复制以保证装状态栏不装 monitor 时也能用。
+  try {
+    const helperSrc = path.join(__dirname, '..', 'scripts', 'anthropic_http.py');
+    const helperDst = path.join(CLAUDE_DIR, 'anthropic_http.py');
+    if (fileExists(helperSrc)) fs.copyFileSync(helperSrc, helperDst);
+  } catch { /* ignore */ }
+
   const settings = readSettings();
   // 早期版本误装到 hooks.Stop，顺手清掉避免脚本被跑两次
   removeLegacyStopHook(settings);

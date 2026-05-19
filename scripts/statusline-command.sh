@@ -74,11 +74,21 @@ try:
             print(d['five_hour'], d['seven_day'], d.get('five_hour_reset', ''))
             sys.exit()
 
-    req = urllib.request.Request(
-        'https://api.anthropic.com/api/oauth/usage',
-        headers={'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20', 'Accept': 'application/json'}
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    # 走共享 cookie jar（v3.10.2+）：~/.claude/anthropic_http.py 由 monitor 安装时一并复制
+    sys.path.insert(0, os.path.expanduser('~/.claude'))
+    try:
+        from anthropic_http import request_anthropic
+        code, body, _ = request_anthropic('https://api.anthropic.com/api/oauth/usage', token, timeout=5)
+        if code != 200:
+            raise RuntimeError(f'http {code}')
+        resp = json.loads(body)
+    except Exception:
+        # helper 不存在或失败时退回直连一次（保留旧行为，避免新装用户没装 monitor 时状态栏完全坏掉）
+        req = urllib.request.Request(
+            'https://api.anthropic.com/api/oauth/usage',
+            headers={'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20', 'Accept': 'application/json'}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
     data = {
         'five_hour': resp.get('five_hour', {}).get('utilization', ''),
         'seven_day': resp.get('seven_day', {}).get('utilization', ''),
@@ -210,11 +220,19 @@ try:
             print(d['name'], '|', d['email'], '|', d['plan'])
             sys.exit()
 
-    req = urllib.request.Request(
-        'https://api.anthropic.com/api/oauth/profile',
-        headers={'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20', 'Accept': 'application/json'}
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    sys.path.insert(0, os.path.expanduser('~/.claude'))
+    try:
+        from anthropic_http import request_anthropic
+        code, body, _ = request_anthropic('https://api.anthropic.com/api/oauth/profile', token, timeout=5)
+        if code != 200:
+            raise RuntimeError(f'http {code}')
+        resp = json.loads(body)
+    except Exception:
+        req = urllib.request.Request(
+            'https://api.anthropic.com/api/oauth/profile',
+            headers={'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20', 'Accept': 'application/json'}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
     org_type = resp.get('organization', {}).get('organization_type', '')
     plan_map = {'claude_max': 'Max', 'claude_pro': 'Pro', 'claude_enterprise': 'Enterprise', 'claude_team': 'Team'}
     data = {
@@ -237,9 +255,8 @@ line3=""
 [ -n "$user_email" ] && line3="${line3} $(printf '\033[90m<%s>\033[0m' "$user_email")"
 [ -n "$user_plan"  ] && line3="${line3} $(printf '\033[35m[%s]\033[0m' "$user_plan")"
 
-# 最近 30 分钟内有过自动切换 → 追加红色提示让用户重启 Claude Code
-# Claude Code 进程启动时把 token 加载进内存，自动切换只改文件、不改内存中的 token；
-# 必须重启 Claude Code 才能让新 token 生效
+# 最近 30 分钟内有过自动切换 → 第 4 行显示灰色告知（实测对当前 Claude Code 进程透明，
+# 无需重启，下次请求自动用新 token；这里只是告诉用户切换发生了，看个心安）
 switch_hint=$(python3 -c "
 import json, os, time
 from datetime import datetime
@@ -248,21 +265,26 @@ if not os.path.exists(p): exit()
 try:
     d = json.load(open(p, encoding='utf-8'))
     ts = float(d.get('ts', 0))
-    if time.time() - ts > 1800: exit()  # 30 分钟外不提示
+    if time.time() - ts > 300: exit()  # 5 分钟外不提示
     to = d.get('to', '?')
     when = datetime.fromtimestamp(ts).strftime('%H:%M')
-    print(f'已切到 {to}（{when}），重启 Claude Code 生效')
+    print(f'最近切到 {to}（{when}）')
 except Exception:
     pass
 " 2>/dev/null)
+line4=""
 if [ -n "$switch_hint" ]; then
-  hint_colored=$(printf '\033[1;31m⚠ %s\033[0m' "$switch_hint")
-  line3="${line3:+${line3} | }${hint_colored}"
+  line4=$(printf '\033[90m%s\033[0m' "$switch_hint")
 fi
 
 # === 输出 ===
-if [ -n "$line3" ]; then
+# 切换提示独占第 4 行，避免和账号信息挤在一起把窄状态栏撑爆
+if [ -n "$line3" ] && [ -n "$line4" ]; then
+  printf '%s\n%s\n%s\n%s' "$line1" "$line2" "$line3" "$line4"
+elif [ -n "$line3" ]; then
   printf '%s\n%s\n%s' "$line1" "$line2" "$line3"
+elif [ -n "$line4" ]; then
+  printf '%s\n%s\n%s' "$line1" "$line2" "$line4"
 else
   printf '%s\n%s' "$line1" "$line2"
 fi
