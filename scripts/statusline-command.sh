@@ -6,6 +6,11 @@ CCS_VERSION="__CCS_VERSION__"
 
 input=$(cat)
 
+# 状态栏心跳：守护进程靠 ~/.ccs/statusline-heartbeat 的 mtime 判断"用户是否在用 Claude Code"。
+# 用户离开后状态栏不再刷新 → 心跳停 → 守护进入 idle-recheck 模式，避免空轮询累积 cf-429。
+mkdir -p "$HOME/.ccs" 2>/dev/null
+: > "$HOME/.ccs/statusline-heartbeat" 2>/dev/null
+
 parse() {
   python3 -c "
 import sys, json

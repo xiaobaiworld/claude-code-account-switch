@@ -1,23 +1,36 @@
 """用量监控守护进程。
 
-调度循环：
-  5h < 99        → 100s 轮询（与共享缓存 TTL 对齐，实测更密会触发 cf-429）
+调度循环（v3.10.7 起）：
+  每 10s 一轮：
+    心跳静默   → idle-recheck（5min 一次只看心跳，不读缓存不发请求）
+    缓存新鲜   → 用缓存里的 usage 数据走决策（状态栏每次刷新会写新鲜缓存）
+    缓存 stale → 自己发请求（_query_active_usage）
+
+  5h < 99        → 继续看缓存 / 100s 后再自己查
   5h >= 99       → 切换（成功也不退出，继续盯新 active）
   真 429         → 当作 active 用尽，写表 + 切换
-  cf-429 / 错误  → 100s 重试
+  cf-429 / 错误  → 100s 后再自己查（活跃时）
   全候选用尽     → sleep 到最早 reset + 60s 再醒
   disabled 文件  → 退出
   运行超 7 天    → 退出（兜底）
 
+设计核心：状态栏每次刷新都会把最新 usage 写入 ~/.ccs/usage-shared-cache.json，守护只看
+缓存就能拿到秒级新鲜数据，自己仅在缓存 stale 时才发请求。响应延迟从 100s 降到 ≤10s，
+HTTP 请求量基本不增加（状态栏本来就在打）。
+
 单例保护：~/.ccs/usage-monitor.pid
 """
-import json, os, sys, time, atexit
+import json, os, sys, time, hashlib, atexit
 import urllib.request, urllib.error
 from datetime import datetime, timezone
 
 PID_FILE  = os.path.expanduser('~/.ccs/usage-monitor.pid')
 LOG       = os.path.expanduser('~/.ccs/auto-switch.log')
 DISABLED  = os.path.expanduser('~/.ccs/usage-monitor.disabled')
+HEARTBEAT = os.path.expanduser('~/.ccs/statusline-heartbeat')
+CACHE_FILE = os.path.expanduser('~/.ccs/usage-shared-cache.json')
+CREDS     = os.path.expanduser('~/.claude/.credentials.json')
+USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 
 MONITOR_THRESHOLD  = 90   # 用量分档阈值（保留，未来想分档时改 INTERVAL_SLOW 即可）
 SWITCH_THRESHOLD   = 99   # 高于此值触发切换
@@ -26,6 +39,23 @@ INTERVAL_SLOW      = 100  # 90-98% 紧密期、错误重试、切换失败重试
 # v3.10.4 起两档都 100s：与共享缓存 TTL 对齐；实测 30s 会触发 Cloudflare 边缘 429
 MAX_ERRORS         = 5
 MAX_RUNTIME        = 86400 * 7  # 7 天（实质无限，disabled 文件才是真正的停止信号）
+
+# v3.10.6：状态栏心跳门控。用户离开 Claude Code 时状态栏停止刷新，心跳 mtime 不再更新。
+# 守护每轮先看心跳：静默 ≥ ACTIVE_WINDOW 就进 idle-recheck 模式，IDLE_RECHECK 一次只看
+# mtime，不发任何 HTTP 请求。心跳恢复立刻回正常轮询。
+# 真 429（用尽）路径不受门控影响——用尽就该切，跟用户在不在用无关。
+# STARTUP_GRACE：守护刚启动时给的宽限期，无视心跳门控正常轮询。覆盖"首次装完还没刷新过
+# 状态栏"或"开机自启时状态栏还没起来"的场景，避免守护一启动就误判为静默。
+ACTIVE_WINDOW = 300   # 状态栏 5min 内有刷新视为活跃
+IDLE_RECHECK  = 300   # 静默时每 5min 看一次心跳
+STARTUP_GRACE = 600   # 启动后 10min 内无视心跳门控
+
+# v3.10.7：缓存优先调度。
+# 守护每 CACHE_TICK 秒看一次共享缓存：状态栏每次刷新会写最新 usage，守护读到就走决策。
+# 缓存 stale ≥ CACHE_MAX_AGE 时（如用户在用 Claude 但状态栏不再刷新）才自己发请求。
+# 比之前 100s 固定轮询响应快 10×，HTTP 量基本不增（状态栏本来就在打）。
+CACHE_TICK     = 10
+CACHE_MAX_AGE  = 100  # 与 anthropic_http.CACHE_TTL 对齐
 
 
 def log(msg):
@@ -98,9 +128,66 @@ def _acquire_singleton():
     return True
 
 
+def _active_token():
+    """读 ~/.claude/.credentials.json 取当前 active token。每轮都重读，
+    避免守护把切换前的旧 token 一直缓存住。"""
+    if not os.path.exists(CREDS):
+        return None
+    try:
+        return json.load(open(CREDS, encoding='utf-8'))['claudeAiOauth']['accessToken']
+    except Exception:
+        return None
+
+
+def _read_cached_usage(token):
+    """直接读 ~/.ccs/usage-shared-cache.json 里 token 的 usage entry，不发请求。
+
+    返回 (five_hour, resets_at, extra, age_s)：
+      - (float, str, None, age)      : 缓存里是 200，正常用量数据
+      - (None, '',  429, age)        : 缓存里是真 429（active 用尽）
+      - (None, '',  'cf429', age)    : 缓存里是 cf-edge 429
+      - (None, None, 'miss', None)   : 缓存里没这个条目（首次启动 / token 刚换）
+      - (None, None, 'parse', age)   : 缓存解析失败（极少见）
+    age_s 是 entry 距今秒数；'miss' 时为 None。
+    """
+    if not token:
+        return (None, None, 'miss', None)
+    th = hashlib.md5(token.encode()).hexdigest()[:8]
+    key = f'{th}:{USAGE_URL}'
+    try:
+        cache = json.load(open(CACHE_FILE, encoding='utf-8'))
+    except Exception:
+        return (None, None, 'miss', None)
+    entry = cache.get(key)
+    if not entry:
+        return (None, None, 'miss', None)
+    age = time.time() - entry.get('ts', 0)
+    code = entry.get('code')
+    if code == 200:
+        try:
+            body = bytes.fromhex(entry.get('body_hex', '')) if entry.get('body_hex') else b''
+            resp = json.loads(body)
+            fh = resp.get('five_hour') or {}
+            return (float(fh.get('utilization') or 0.0), fh.get('resets_at') or '', None, age)
+        except Exception:
+            return (None, None, 'parse', age)
+    if code == 429:
+        # 区分真 429 / cf-edge 429——和 _query_active_usage 同款判定
+        headers = entry.get('headers') or {}
+        if 'anthropic-organization-id' in headers:
+            return (None, '', 429, age)
+        return (None, '', 'cf429', age)
+    # 其他状态码（5xx / token 失效等）当作 miss 让守护自己重试
+    return (None, None, 'miss', age)
+
+
 def _query_active_usage():
     """查 ~/.claude/.credentials.json 里 token 的 5h 用量。
-    返回 (five_hour:float, resets_at:str) 或 (None, http_code:int) 或 (None, None)。
+    返回 (five_hour:float, extra)：
+      - (float, str)  : 查到数据，extra=resets_at
+      - (None, 429)   : 真 429（Anthropic 后端，业务上视为 active 用尽）
+      - (None, 'cf429'): Cloudflare 边缘 429（查询限流，不是用尽）
+      - (None, None)  : 其他错误（网络、5xx、token 失效等）
     走 anthropic_http 共享 cookie jar，避免 Cloudflare _cfuvid 缺失导致的边缘 429。"""
     creds = os.path.expanduser('~/.claude/.credentials.json')
     if not os.path.exists(creds):
@@ -115,8 +202,11 @@ def _query_active_usage():
         from anthropic_http import request_anthropic, is_real_anthropic_429
     except Exception:
         return None, None
+    # 守护是兜底自查，必然是缓存 stale 时才走到——明确禁用 helper 内的缓存层
+    # 避免读到 100s+ 的旧缓存还以为查到了。
     code, body, headers = request_anthropic(
-        'https://api.anthropic.com/api/oauth/usage', token, timeout=8, caller='monitor')
+        'https://api.anthropic.com/api/oauth/usage', token, timeout=8,
+        caller='monitor', allow_cache=False)
     if code == 200:
         try:
             resp = json.loads(body)
@@ -126,11 +216,11 @@ def _query_active_usage():
             return None, None
     if code == 429:
         # 区分真 429（Anthropic 后端，含用尽）vs Cloudflare 边缘 429
-        # helper 已写日志，这里不再重复
+        # v3.10.6 起 cf-edge 429 用字符串 'cf429' 标识，主循环用它触发心跳门控
         if is_real_anthropic_429(headers):
             return None, 429
-        return None, None  # cf-edge 429 当临时错误，主循环 60s 重试
-    return None, code
+        return None, 'cf429'
+    return None, None
 
 
 def _do_switch(five_hour, resets_at, force=False, active_got_429=False):
@@ -160,6 +250,29 @@ def _parse_iso(s):
         return datetime.fromisoformat(s.replace('Z', '+00:00'))
     except Exception:
         return None
+
+
+def _statusline_active(window=ACTIVE_WINDOW):
+    """状态栏 window 秒内是否刷新过。心跳文件不存在或读不到 mtime 都视为不活跃。"""
+    try:
+        return (time.time() - os.path.getmtime(HEARTBEAT)) < window
+    except OSError:
+        return False
+
+
+def _idle_recheck_loop(reason):
+    """用户静默时进入：每 IDLE_RECHECK 秒只看心跳 mtime，不发任何 HTTP 请求。
+    心跳恢复活跃 / disabled 标志出现 / 超过 MAX_RUNTIME 才返回。
+    返回 True 表示被 disabled 中断，调用方应退出主循环。"""
+    log(f'monitor: statusline idle ({reason}), entering idle-recheck (no polling until user returns)')
+    while True:
+        if os.path.exists(DISABLED):
+            return True
+        if _statusline_active():
+            log('monitor: statusline activity detected, resuming polling')
+            return False
+        if _sleep_responsive(IDLE_RECHECK):
+            return True
 
 
 def _sleep_responsive(seconds, slice_s=30):
@@ -198,7 +311,8 @@ def main():
 
     start_time = time.time()
     errors = 0
-    low_ticks = 0  # 5h < 90% 的连续轮次计数，用于稀疏心跳日志
+    last_low_log = 0.0   # 上次 "5h<90% idle" 心跳日志的时间戳，每 10min 一条避免刷屏
+    last_self_query = 0.0  # 上次守护自己发请求的时间，用于 stale 节流
 
     while True:
         # 超时保护
@@ -211,85 +325,126 @@ def main():
             log('monitor exit: disabled flag found')
             break
 
-        five_hour, extra = _query_active_usage()
+        # v3.10.6：用户没在用 Claude Code 时不轮询。
+        # 状态栏不刷新 → 用量不会涨 → polling 没意义；空轮询只会累积 cf-429。
+        # 启动后 STARTUP_GRACE 内无视门控，避免开机自启时状态栏未起 / 首装未刷新就误停。
+        in_grace = (time.time() - start_time) <= STARTUP_GRACE
+        if not in_grace and not _statusline_active():
+            if _idle_recheck_loop('no recent statusline activity'):
+                break
+            continue
 
-        # 429 → active 用尽（v3.10.2+ 业务约定）：写表标用尽 + 进切换决策
-        if five_hour is None and extra == 429:
-            log('monitor: 429 received, marking active exhausted, attempting switch')
+        # v3.10.7：缓存优先。先看共享缓存，状态栏每次刷新都会写新鲜数据进去。
+        # 缓存新鲜（age < CACHE_MAX_AGE）→ 用缓存里的 usage 走决策，不发请求。
+        # 缓存 miss/stale → 自己发请求，但同样有 100s 节流避免和状态栏抢着打 CF。
+        token = _active_token()
+        five_hour, resets_at, extra, age = _read_cached_usage(token)
+
+        cache_fresh = (age is not None and age < CACHE_MAX_AGE
+                       and extra not in ('miss', 'parse'))
+        if not cache_fresh:
+            # 缓存不可用：节流 + 自己发请求
+            now = time.time()
+            if now - last_self_query < CACHE_MAX_AGE:
+                # 距上次自查不到 100s，再等一拍看状态栏会不会写新值
+                if _sleep_responsive(CACHE_TICK):
+                    break
+                continue
+            last_self_query = now
+            five_hour, q_extra = _query_active_usage()
+            # 把查询结果回填到决策变量（_query_active_usage 已自动写共享缓存）
+            if isinstance(q_extra, str) and q_extra in ('cf429',):
+                extra = q_extra
+                resets_at = ''
+            elif q_extra == 429:
+                extra = 429
+                resets_at = ''
+            elif q_extra is None and five_hour is None:
+                extra = 'query-failed'
+                resets_at = ''
+            else:
+                # 200 OK，q_extra 是 resets_at 字符串
+                extra = None
+                resets_at = q_extra or ''
+
+        # —— 决策分支 ——
+
+        # 真 429 → active 用尽：写表标用尽 + 切换
+        if extra == 429:
+            log('monitor: 429 (active exhausted), attempting switch')
             r = _do_switch(None, '', force=True, active_got_429=True)
             next_reset = r.get('next_reset_at')
             if r['switched'] and next_reset:
-                # 已切到"最早能 reset 的号"，sleep 到它恢复
                 if _sleep_until_reset(next_reset):
                     break
                 continue
             if r['switched']:
-                # 切到了正常号，下一轮立刻盯它
                 if _sleep_responsive(INTERVAL_SLOW):
                     break
                 continue
             if next_reset:
-                # 没切（active 自己就是最早恢复的），原地 sleep
                 if _sleep_until_reset(next_reset):
                     break
                 continue
-            # active 没历史 reset 或候选全 unknown：保守 60s 重试
             if _sleep_responsive(INTERVAL_SLOW):
                 break
             continue
 
-        # 其他查询失败：固定 60s 重试，不退出（网络抖动应自愈）。
-        # v3.10.1 前用指数退避 60/120/240/300s，开机自启场景下要 11 分钟才恢复，
-        # 期间用量监控完全失明，不值得；统一 60s 即可。
-        if five_hour is None:
+        # cf-edge 429：查询限流，不是用尽。下一轮 10s 后再看缓存（状态栏可能写入新值）。
+        # 心跳门控已在循环顶处理；走到这里说明用户活跃或在宽限期。
+        if extra == 'cf429':
             errors += 1
-            log(f'monitor: query failed ({errors}), retry in {INTERVAL_SLOW}s')
-            if _sleep_responsive(INTERVAL_SLOW):
+            log(f'monitor: cf-edge 429 ({errors}), waiting for fresh cache')
+            if _sleep_responsive(CACHE_TICK):
                 break
             continue
 
-        errors = 0  # 查到数据就重置计数
+        # 查询失败（网络、5xx、token 失效等）：10s 后再看缓存
+        if extra == 'query-failed' or five_hour is None:
+            errors += 1
+            log(f'monitor: query failed ({errors}), waiting for fresh cache')
+            if _sleep_responsive(CACHE_TICK):
+                break
+            continue
 
-        # 用量低于 90%：从状态栏 spawn 时会预判，但从 Web UI spawn 时无条件启动，
-        # 所以这里不退出，安静等待 60s 继续轮询（disabled / 超时 才是退出条件）。
-        # 每 10 轮（约 10 分钟）记一条心跳日志，确认守护活着；其他轮静默不刷屏。
+        errors = 0  # 查到数据就重置
+
+        # 用量低于 90%：闲时不动；每 10min 记一条心跳日志确认守护活着
         if five_hour < MONITOR_THRESHOLD:
-            low_ticks += 1
-            if low_ticks == 1 or low_ticks % 10 == 0:
-                log(f'monitor: 5h={five_hour}% (< {MONITOR_THRESHOLD}%), idle polling every {INTERVAL_IDLE}s')
-            if _sleep_responsive(INTERVAL_IDLE):
+            now = time.time()
+            if now - last_low_log >= 600:
+                src = f'cache age={int(age)}s' if cache_fresh else 'self-query'
+                log(f'monitor: 5h={five_hour}% (< {MONITOR_THRESHOLD}%, {src})')
+                last_low_log = now
+            if _sleep_responsive(CACHE_TICK):
                 break
             continue
-        low_ticks = 0  # ≥ 90% 时重置心跳计数
 
         # 触发切换
         if five_hour >= SWITCH_THRESHOLD:
-            log(f'monitor: 5h={five_hour}%, triggering switch')
-            r = _do_switch(five_hour, extra)
+            src = f'cache age={int(age)}s' if cache_fresh else 'self-query'
+            log(f'monitor: 5h={five_hour}% ({src}), triggering switch')
+            r = _do_switch(five_hour, resets_at)
             next_reset = r.get('next_reset_at')
             if r['switched'] and next_reset:
-                # 切到的是"最早能 reset 的用尽号"，sleep 到它恢复
                 if _sleep_until_reset(next_reset):
                     break
                 continue
             if r['switched']:
-                # 切到正常号，继续盯（不退出守护：旧行为 break 后靠 watchdog 拉，乒乓时会失控）
                 if _sleep_responsive(INTERVAL_SLOW):
                     break
                 continue
             if next_reset:
-                # active 自己是最早 reset 的，原地 sleep
                 if _sleep_until_reset(next_reset):
                     break
                 continue
-            log('monitor: switch not completed, retry in 60s')
+            log('monitor: switch not completed, retry')
             if _sleep_responsive(INTERVAL_SLOW):
                 break
             continue
 
-        # 90-98% 之间，紧密轮询（60s）；99%+ 已在上面切换分支处理
-        log(f'monitor: 5h={five_hour}%, next check in {INTERVAL_SLOW}s')
-        if _sleep_responsive(INTERVAL_SLOW):
+        # 90-98% 紧密期：10s 一拍盯着，等到 99% 立刻切
+        if _sleep_responsive(CACHE_TICK):
             break
 
     _remove_pid()

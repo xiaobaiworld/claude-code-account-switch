@@ -303,7 +303,12 @@ def decide_and_switch(cur_5h_val, cur_reset, force_switch=False, active_got_429=
     log(f'5h={cur_5h_val}% (resets {cur_reset}), {tag}')
     try:
         ccs_bin = shutil.which('ccs') or 'ccs'
-        r = subprocess.run([ccs_bin, target], capture_output=True, text=True, timeout=15)
+        # Windows 上 ccs 实际是 npm 装的 ccs.cmd；subprocess.run 调 .cmd 会弹一闪而过的
+        # 命令窗口。加 CREATE_NO_WINDOW 隐藏。POSIX 上不传这个 kwarg。
+        run_kwargs = {'capture_output': True, 'text': True, 'timeout': 15}
+        if sys.platform == 'win32':
+            run_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        r = subprocess.run([ccs_bin, target], **run_kwargs)
         if r.returncode == 0:
             log(f'switched to {target} OK')
             write_last_switch(cur, target)
