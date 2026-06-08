@@ -518,20 +518,26 @@ function render(data) {
     const isActive = name === activeAccount;
     const isApiKey = a.type === 'apikey';
     const needsLogin = !isApiKey && a.loggable === false;
+    const isFree = !isApiKey && a.subscriptionType === 'free';
     const expiryText = needsLogin ? '未登录' : (a.expiresIn || 'unknown');
+    // OAuth 状态徽章：未登录 > free > 其它订阅等级（绿色）
+    // API Key 维持原"API Key"紫色徽章
+    let statusBadge = '';
+    if (isApiKey) {
+      statusBadge = '<span class="badge badge-purple">API Key</span>';
+    } else if (needsLogin) {
+      statusBadge = '<span class="badge badge-red">未登录</span>';
+    } else if (isFree) {
+      statusBadge = '<span class="badge badge-red">免费版</span>';
+    } else if (a.subscriptionType) {
+      statusBadge = '<span class="badge badge-green">' + esc(a.subscriptionType) + '</span>';
+    }
     return '<div class="account-item' + (isActive ? ' is-active' : '') + '">' +
       '<div class="avatar' + (isActive ? ' avatar-active' : '') + '">' + esc(name[0].toUpperCase()) + '</div>' +
       '<div class="acct-info">' +
         '<div class="acct-name">' + esc(name) +
           (isActive ? '<span class="badge badge-blue">使用中</span>' : '') +
-          (isApiKey
-            ? '<span class="badge badge-purple">API Key</span>'
-            : (a.subscriptionType ? '<span class="badge badge-purple">' + esc(a.subscriptionType) + '</span>' : '')) +
-          (!isApiKey && !isActive
-            ? (needsLogin
-                ? '<span class="badge badge-red">未登录</span>'
-                : '<span class="badge badge-green">可用</span>')
-            : '') +
+          statusBadge +
         '</div>' +
         '<div class="acct-meta">' +
           (isApiKey
@@ -546,7 +552,8 @@ function render(data) {
         (isActive
           ? '<button class="btn btn-sm btn-current" disabled>使用中</button>'
           : '<button class="btn btn-sm btn-outline switch-btn" data-name="' + esc(name) + '"' +
-            (needsLogin ? ' data-needs-login="1"' : '') + '>切换</button>') +
+            (needsLogin ? ' data-needs-login="1"' : '') +
+            (isFree ? ' data-free="1"' : '') + '>切换</button>') +
         '<button class="btn btn-sm btn-ghost edit-btn" data-name="' + esc(name) + '">编辑</button>' +
         '<button class="btn btn-sm btn-danger remove-btn" data-name="' + esc(name) + '">删除</button>' +
       '</div>' +
@@ -557,6 +564,10 @@ function render(data) {
     btn.addEventListener('click', () => {
       if (btn.dataset.needsLogin === '1') {
         showToast('"' + btn.dataset.name + '" 未登录，无法切换。请在 Claude Code 中重新登录该账号后，回到这里重新导入。', 'err');
+        return;
+      }
+      if (btn.dataset.free === '1') {
+        showToast('"' + btn.dataset.name + '" 是 Claude 免费版，无法使用 Claude Code。', 'err');
         return;
       }
       doSwitch(btn.dataset.name);
