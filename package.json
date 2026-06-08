@@ -1,6 +1,6 @@
 {
   "name": "claude-code-account-switch",
-  "version": "3.12.2",
+  "version": "3.12.3",
   "description": "Claude Code 多账号切换工具，支持 Windows/macOS/Linux/WSL，OAuth + API Key 双模式，多端 web 共享同步",
   "bin": {
     "ccs": "bin/ccs.js"
@@ -40,6 +40,7 @@
     "scripts/statusline-command.sh",
     "scripts/auto_switch_core.py",
     "scripts/usage_monitor.py",
-    "scripts/anthropic_http.py"
+    "scripts/anthropic_http.py",
+    "scripts/query_profile.py"
   ]
 }

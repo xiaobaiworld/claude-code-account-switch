@@ -282,6 +282,21 @@ class AccountStore {
     return this._entry(n, this._config.accounts[n]);
   }
 
+  // 写入 profile API 查回的真实订阅状态。web.js 切换前后异步调 query_profile.py
+  // 拿到结果后写回。{ organizationType, isFree, fetchedAt }；查询失败传 null 跳过。
+  setLivePlan(name, plan) {
+    const n = sanitizeName(name);
+    const acct = this._config.accounts[n];
+    if (!acct || acct.type !== 'oauth') return;
+    if (!plan || typeof plan !== 'object') return;
+    acct.livePlan = {
+      organizationType: plan.organizationType || '',
+      isFree: !!plan.isFree,
+      fetchedAt: new Date().toISOString(),
+    };
+    this._save();
+  }
+
   _switchOauth(n, prev) {
     const snapPath = credentialsSnapshotPath(n);
     if (!fileExists(snapPath)) throw new Error(`Snapshot not found for "${n}"`);
@@ -502,6 +517,7 @@ class AccountStore {
         ...entry,
         isActive,
         loggable,
+        livePlan: raw.livePlan || null,
         expiresIn: raw.type === 'apikey' ? null : formatExpiry(entry.expiresAt),
       };
     }

@@ -518,7 +518,11 @@ function render(data) {
     const isActive = name === activeAccount;
     const isApiKey = a.type === 'apikey';
     const needsLogin = !isApiKey && a.loggable === false;
-    const isFree = !isApiKey && a.subscriptionType === 'free';
+    // 优先用 livePlan（profile API 查回的真实订阅状态），fallback 到 token 自带 sub 字段
+    const isFree = !isApiKey && (
+      (a.livePlan && a.livePlan.isFree) ||
+      (!a.livePlan && a.subscriptionType === 'free')
+    );
     const expiryText = needsLogin ? '未登录' : (a.expiresIn || 'unknown');
     // OAuth 状态徽章：未登录 > free > 其它订阅等级（绿色）
     // API Key 维持原"API Key"紫色徽章
@@ -529,8 +533,14 @@ function render(data) {
       statusBadge = '<span class="badge badge-red">未登录</span>';
     } else if (isFree) {
       statusBadge = '<span class="badge badge-red">免费版</span>';
-    } else if (a.subscriptionType) {
-      statusBadge = '<span class="badge badge-green">' + esc(a.subscriptionType) + '</span>';
+    } else {
+      // 优先 livePlan.organizationType（去 claude_ 前缀更易读），fallback token 字段
+      const planText = (a.livePlan && a.livePlan.organizationType)
+        ? a.livePlan.organizationType.replace(/^claude_/, '')
+        : (a.subscriptionType || '');
+      if (planText) {
+        statusBadge = '<span class="badge badge-green">' + esc(planText) + '</span>';
+      }
     }
     return '<div class="account-item' + (isActive ? ' is-active' : '') + '">' +
       '<div class="avatar' + (isActive ? ' avatar-active' : '') + '">' + esc(name[0].toUpperCase()) + '</div>' +
