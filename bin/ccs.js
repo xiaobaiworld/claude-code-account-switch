@@ -20,6 +20,7 @@ const share = require(path.join(__dirname, '..', 'src', 'share'));
 const { startWebServer } = require(path.join(__dirname, '..', 'src', 'web'));
 const monitor = require(path.join(__dirname, '..', 'src', 'monitor'));
 const autostart = require(path.join(__dirname, '..', 'src', 'autostart'));
+const { spawnSync } = require('child_process');
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -29,7 +30,7 @@ const WEB_DEFAULT_PORT = 7899;
 const COMMANDS = new Set([
   'import', 'switch', 'status', 'accounts',
   'clear-current', 'logout', 'remove', 'doctor', 'web', 'sync', 'share',
-  'monitor', 'autostart',
+  'monitor', 'autostart', 'app',
 ]);
 
 async function main() {
@@ -72,7 +73,24 @@ async function dispatch(cmd, rest) {
     case 'share':        return cmdShare(rest);
     case 'monitor':      return cmdMonitor(rest);
     case 'autostart':    return cmdAutostart(rest);
+    case 'app':          return cmdApp(rest);
   }
+}
+
+function cmdApp(rest) {
+  if (!IS_MAC) {
+    throw new Error('ccs app 仅支持 macOS Claude 桌面客户端');
+  }
+  const scriptPath = path.join(__dirname, '..', 'scripts', 'desktop_app.py');
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`desktop app helper not found: ${scriptPath}`);
+  }
+  const r = spawnSync('python3', [scriptPath, ...rest], {
+    stdio: 'inherit',
+    windowsHide: true,
+  });
+  if (r.error) throw r.error;
+  if (r.status !== 0) process.exit(r.status || 1);
 }
 
 function cmdMonitor(rest) {
@@ -668,6 +686,13 @@ Web 服务：
   ccs monitor enable                 启用守护并注册开机自启（任务计划程序）
   ccs monitor disable                停止守护并移除自启
   ccs monitor revive                 守护掉了就拉起来（任务计划程序登录时调用此命令）
+
+Claude App（macOS 桌面客户端）：
+  ccs app status                     查看 Claude App 状态和已保存账号包
+  ccs app capture <name>             抓取当前 Claude App 登录态为账号包
+  ccs app list                       列出已保存的 Claude App 账号包
+  ccs app restore <name>             退出 Claude App 后应用指定账号包（apply 同义）
+  ccs app rollback                   回滚最近一次 restore 前的 Claude App 文件备份
 
 开机自启（仅 Windows）：
   ccs autostart status               查看任务计划程序中 CCS-UsageMonitor 任务状态

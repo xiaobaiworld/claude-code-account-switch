@@ -20,3 +20,9 @@ __pycache__/
 
 # 本地开发笔记（不上传）
 doc/
+
+# 桌面端探针：vault 含真实会话密钥，snapshots/日志含本机数据，绝不上传
+probe/vault/
+probe/snapshots/
+probe/backups/
+probe/probe.log

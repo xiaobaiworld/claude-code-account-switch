@@ -132,6 +132,25 @@ ccs share enable --peer http://X:7899 --secret abc
 ccs web stop
 ```
 
+## Claude App 桌面客户端账号（macOS）
+
+Claude App 的登录态不在 `~/.claude`，而在桌面客户端自己的 Cookies 和 `~/Library/Application Support/Claude/config.json`。因此 CLI 切号只会影响 Claude Code；要让 Claude App 也切到对应账号，需要单独抓取和恢复 App 登录态：
+
+```bash
+ccs app status                 # 查看 Claude App 状态和已保存账号包
+ccs app capture AikenMercer    # 在 App 已登录该账号时抓取登录态
+ccs app list                   # 列出已保存的 App 账号包
+ccs app restore AikenMercer    # 退出 Claude App 后恢复/应用该账号包
+ccs app rollback               # 回滚最近一次 restore 前的 App 文件备份
+```
+
+注意：
+
+- 仅支持 macOS Claude 桌面客户端
+- `restore/apply` 前必须完全退出 Claude App（Cmd+Q），否则 App 可能把文件改动覆盖回去
+- 账号包保存到 `~/.ccs/desktop-app/vault/`，其中包含真实 session cookie，目录权限应保持私密，不要提交或同步到不可信位置
+- 每次 restore 前会自动备份 `Cookies`、`config.json` 和 `~/.claude.json` 到 `~/.ccs/desktop-app/backups/`
+
 ## API Key 账号
 
 支持通过 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` 使用第三方 API 服务：
